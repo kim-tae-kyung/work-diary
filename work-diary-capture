@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""work-diary-capture — local macOS work diary.
+
+Captures every display, classifies the current activity with a local Ollama vision
+model into one short Korean line (calendar-style time tracking: coding / research /
+docs / rest …), redacts it when secrets are detected, and appends a single line per
+capture (time | status | summary) to a daily Markdown file. The only input is
+screenshot images. Resized/encoded images are deleted right after analysis; the
+latest screenshot per display is kept in the state dir (~/Library/Application
+Support/work-diary). When a summary is essentially the same as the last one, the
+line is skipped. All processing stays local.
+
+Docs: docs/PRD.md (what/why), docs/design.md (how).
+Standard library only. No external dependencies.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import difflib
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+
+DEFAULTS = {
+    "diary_root": str(Path.home() / "Desktop" / "diary" / "diary"),
+    "model": "gemma4:12b",
+    "ollama_url": "http://localhost:11434",
+    "api_timeout": 180,
+    "total_timeout": 240,
+    "resize_single": 1600,
+    "resize_multi": 2200,
+    "max_displays": 4,
+    "block_tags": ["secret-detected", "possibly-sensitive"],
+    # Skip a log line when the new summary is ~the same as the last written one (design §skip).
+    "skip_similar": True,
+    "similarity_threshold": 0.85,   # difflib ratio ≥ this ⇒ treat as a duplicate, skip the line
+    # Keep the latest screenshot per display in the state dir (refreshed every run).
+    "store_last_screenshot": True,
+}
+
+# Output schema forcing Ollama to always return valid JSON (design §model request).
+# `summary` is one short Korean activity line (the final record); `caution_tags` drives redaction only.
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "caution_tags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary", "caution_tags"],
+}
+
+# Greedy decoding for factual screenshot summarization. The gemma model ships with
+# temperature=1 by default, which makes the OCR/summary hallucinate and vary run to
+# run; temperature 0 is greedy, so top_p/top_k are moot — temperature alone suffices.
+MODEL_OPTIONS = {"temperature": 0}
+
+SYSTEM_PROMPT = "You summarize screenshots into privacy-preserving work diary entries."
+
+# {n} is the number of displays passed (one image per display, in capture order).
+USER_PROMPT = (
+    "You are given {n} screenshot(s), one per display, in capture order. In ONE short Korean "
+    "sentence, classify what the user is doing right now at a high level — for calendar-style "
+    "time tracking, not a detailed record.\n"
+    "Name the activity category (examples: 코딩/개발, 자료 조사, 문서·PPT 작성, 이메일·메신저, "
+    "회의·영상 시청, 디자인, 휴식·비업무) and, only if clearly legible, a brief hint of the topic "
+    "or main app. Do NOT guess or invent file names, project names, library names, versions, "
+    "URLs, or any small text you cannot clearly read; when unsure, give only the activity "
+    "category.\n"
+    "Put it in the \"summary\" field as one short Korean sentence (no line breaks). "
+    "Do not transcribe passwords, verification codes, API tokens, private message contents, "
+    "email bodies, or financial/medical/legal details. "
+    "If a screen looks security-sensitive, generalize and add \"possibly-sensitive\" to "
+    "caution_tags. "
+    "If a password/token/verification code is visible on screen, add \"secret-detected\" "
+    "to caution_tags."
+)
+
+
+# ── Exceptions ───────────────────────────────────────────────────────────────
+
+class TimeoutAbort(Exception):
+    """Total run timeout (SIGALRM)."""
+
+
+class OllamaUnavailable(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+class OllamaTimeout(Exception):
+    pass
+
+
+class ModelMissing(Exception):
+    pass
+
+
+class OllamaError(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+class ParseError(Exception):
+    pass
+
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+
+def log(msg: str) -> None:
+    """Non-sensitive status messages to stderr only. Never print images, payloads, or request bodies."""
+    sys.stderr.write(f"[work-diary] {msg}\n")
+
+
+def state_dir() -> Path:
+    return Path.home() / "Library" / "Application Support" / "work-diary"
+
+
+def state_tmp() -> Path:
+    t = state_dir() / "tmp"
+    t.mkdir(parents=True, exist_ok=True)
+    os.chmod(t, 0o700)
+    return t
+
+
+def prev_dir() -> Path:
+    """Holds the latest screenshot per display (shot-<i>.png) and the last summary (summary.txt)."""
+    p = state_dir() / "prev"
+    p.mkdir(parents=True, exist_ok=True)
+    os.chmod(p, 0o700)
+    return p
+
+
+# ── Config loading ───────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    path = os.environ.get("WORK_DIARY_CONFIG") or str(
+        Path.home() / ".config" / "work-diary" / "config.toml"
+    )
+    p = Path(path)
+    if p.exists():
+        try:
+            import tomllib
+        except ModuleNotFoundError:
+            log("config.toml requires Python ≥3.11 (tomllib); using built-in defaults.")
+        else:
+            try:
+                with p.open("rb") as f:
+                    user = tomllib.load(f)
+                cfg.update({k: v for k, v in user.items() if k in DEFAULTS})
+            except (OSError, ValueError) as e:
+                log(f"config.toml parse failed ({type(e).__name__}); using built-in defaults.")
+    return cfg
+
+
+# ── Lock (atomic mkdir; flock not available on macOS by default) ─────────────
+
+def acquire_lock(cfg: dict):
+    state_dir().mkdir(parents=True, exist_ok=True)
+    lock = state_dir() / "capture.lock"
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except FileNotFoundError:
+            age = 0.0
+        if age <= cfg["total_timeout"]:
+            return None  # another run is in progress → exit quietly
+        # stale lock → take over
+        shutil.rmtree(lock, ignore_errors=True)
+        try:
+            lock.mkdir()
+        except FileExistsError:
+            return None
+    try:
+        (lock / "pid").write_text(str(os.getpid()))
+    except OSError:
+        pass
+    return lock
+
+
+def release_lock(lock) -> None:
+    if lock is not None:
+        shutil.rmtree(lock, ignore_errors=True)
+
+
+# ── Capture → resize → encode ────────────────────────────────────────────────
+
+def capture_screens(tmpdir: Path, cfg: dict) -> list[Path]:
+    """Capture one image per display (including non-frontmost monitors). -x mutes the shutter.
+
+    Scans `screencapture -D <index>` from 1 upward and stops when no file is produced.
+    A failure on display 1 is treated as missing permission / capture failure.
+    """
+    created: list[Path] = []
+    for i in range(1, max(1, int(cfg["max_displays"])) + 1):
+        out = tmpdir / f"shot-{i}.png"
+        subprocess.run(
+            ["screencapture", "-x", "-D", str(i), str(out)],
+            capture_output=True,
+        )
+        if out.exists() and out.stat().st_size > 0:
+            created.append(out)
+        elif i == 1:
+            return []  # could not capture the main display → failure
+        else:
+            break  # no display at this index → stop scanning
+    return created
+
+
+def resize_image(src: Path, longest: int, tmpdir: Path) -> Path | None:
+    dst = tmpdir / f"{src.stem}-r{longest}.png"
+    proc = subprocess.run(
+        ["sips", "-Z", str(longest), str(src), "--out", str(dst)],
+        capture_output=True,
+    )
+    if proc.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+        return None
+    return dst
+
+
+def encode_b64(p: Path) -> str:
+    return base64.b64encode(p.read_bytes()).decode("ascii")
+
+
+# ── Previous frame + summary (state) ─────────────────────────────────────────
+
+def save_last_shots(shots: list[Path]) -> None:
+    """Refresh the latest screenshot per display (delete the old set, copy in the current)."""
+    d = prev_dir()
+    for old in d.glob("shot-*.png"):
+        old.unlink(missing_ok=True)
+    for i, shot in enumerate(shots, start=1):
+        shutil.copy2(shot, d / f"shot-{i}.png")
+
+
+def load_last_summary() -> str:
+    """The last written summary, or "" if none."""
+    p = prev_dir() / "summary.txt"
+    try:
+        return p.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def save_last_summary(summary: str) -> None:
+    (prev_dir() / "summary.txt").write_text(summary, encoding="utf-8")
+
+
+def is_duplicate(summary: str, prev: str, threshold: float) -> bool:
+    """True when summary is essentially the same as the previously written one."""
+    if not prev:
+        return False
+    return difflib.SequenceMatcher(None, summary, prev).ratio() >= threshold
+
+
+# ── Model call ───────────────────────────────────────────────────────────────
+
+def ollama_chat(cfg: dict, images_b64: list[str]) -> dict:
+    payload = {
+        "model": cfg["model"],
+        "stream": False,
+        "keep_alive": 0,
+        "format": OUTPUT_SCHEMA,
+        "options": MODEL_OPTIONS,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": USER_PROMPT.format(n=len(images_b64)),
+                "images": images_b64,
+            },
+        ],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    url = cfg["ollama_url"].rstrip("/") + "/api/chat"
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=cfg["api_timeout"]) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:  # Ollama returns 404 for a model that is not installed
+            raise ModelMissing()
+        raise OllamaError(f"http-{e.code}")
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            raise OllamaTimeout()
+        if isinstance(reason, ConnectionRefusedError):
+            raise OllamaUnavailable("connection-refused")
+        raise OllamaUnavailable(type(reason).__name__ if reason else "url-error")
+    except (TimeoutError, socket.timeout):
+        raise OllamaTimeout()
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        raise ParseError()
+
+
+def parse_summary(data: dict) -> dict:
+    try:
+        content = data["message"]["content"]
+    except (KeyError, TypeError):
+        raise ParseError()
+    try:
+        obj = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        raise ParseError()
+    summary = obj.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ParseError()
+    tags = obj.get("caution_tags")
+    tags = [str(t) for t in tags] if isinstance(tags, list) else []
+    # Collapse all whitespace (incl. newlines) so the summary occupies a single log line.
+    return {"summary": " ".join(summary.split()), "caution_tags": tags}
+
+
+# ── Post-screening ───────────────────────────────────────────────────────────
+
+def screen(cfg: dict, tags: list[str]) -> str | None:
+    """Gemma judges sensitivity. Redact if a caution tag is in block_tags; return that tag, else None."""
+    block = {t.lower() for t in cfg["block_tags"]}
+    for t in tags:
+        if t.lower() in block:
+            return t.lower()
+    return None
+
+
+# ── Record builders ──────────────────────────────────────────────────────────
+
+def analyzed_record(summary: str) -> dict:
+    return {"status": "analyzed", "summary": summary}
+
+
+def redacted_record(tag: str) -> dict:
+    return {"status": "redacted", "summary": f"hidden ({tag})"}
+
+
+def error_record(message, reason) -> dict:
+    return {"status": "error", "summary": f"{message} [{reason}]"}
+
+
+def skip_record() -> dict:
+    """Sentinel: summary ~same as the last one → no log line."""
+    return {"status": "skip"}
+
+
+# ── Markdown append ──────────────────────────────────────────────────────────
+
+def append_markdown(cfg: dict, record: dict, now: datetime | None = None) -> Path:
+    now = now or datetime.now()
+    day = now.strftime("%Y-%m-%d")
+    path = (
+        Path(cfg["diary_root"]) / now.strftime("%Y") / now.strftime("%m") / f"{day}.md"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new_file = not path.exists()
+    # OK only for a clean analyzed entry; redacted/error both surface as NOK. The
+    # internal status is kept for control flow; the summary carries the detail.
+    label = "OK" if record["status"] == "analyzed" else "NOK"
+    line = f"- {now.strftime('%H:%M')} | {label} | {record['summary']}\n"
+    with path.open("a", encoding="utf-8") as f:
+        if new_file:
+            f.write(f"## {day}\n\n")
+        f.write(line)
+    return path
+
+
+# ── Pipeline ─────────────────────────────────────────────────────────────────
+
+def run_pipeline(cfg: dict, tmpdir: Path) -> dict:
+    """Return exactly one record (analyzed/redacted/error/skip)."""
+    shots = capture_screens(tmpdir, cfg)
+    if not shots:
+        return error_record(
+            "Screen capture failed. Check Screen Recording permission.",
+            "no-image-or-permission",
+        )
+
+    # Always refresh the latest screenshot per display, regardless of what follows.
+    if cfg["store_last_screenshot"]:
+        save_last_shots(shots)
+
+    longest = cfg["resize_multi"] if len(shots) > 1 else cfg["resize_single"]
+    resized = []
+    for p in shots:
+        r = resize_image(p, longest, tmpdir)
+        if r is None:
+            return error_record("Image resize failed.", "resize-error")
+        resized.append(r)
+
+    images_b64 = [encode_b64(p) for p in resized]
+
+    try:
+        data = ollama_chat(cfg, images_b64)
+    except OllamaUnavailable as e:
+        return error_record(
+            "Ollama API call failed. Check that `ollama serve` is running.", e.code
+        )
+    except OllamaTimeout:
+        return error_record(
+            "Ollama API response timed out. Check model cold-load and resources.",
+            "api-timeout",
+        )
+    except ModelMissing:
+        return error_record(
+            f"Model '{cfg['model']}' not found. Run `ollama pull {cfg['model']}`.",
+            "model-not-found",
+        )
+    except OllamaError as e:
+        return error_record("Ollama returned an error.", e.code)
+    except ParseError:
+        return error_record("Failed to parse model response as JSON.", "invalid-json")
+
+    try:
+        parsed = parse_summary(data)
+    except ParseError:
+        return error_record("Failed to parse model response as JSON.", "invalid-json")
+
+    tag = screen(cfg, parsed["caution_tags"])
+    if tag:
+        return redacted_record(tag)
+
+    # Skip the line when this summary is essentially the same as the last written one.
+    if cfg["skip_similar"] and is_duplicate(
+        parsed["summary"], load_last_summary(), float(cfg["similarity_threshold"])
+    ):
+        return skip_record()
+    return analyzed_record(parsed["summary"])
+
+
+def capture_once(cfg: dict) -> int:
+    lock = acquire_lock(cfg)
+    if lock is None:
+        log("Previous run in progress — exiting")
+        return 0
+
+    tmpdir = Path(tempfile.mkdtemp(dir=state_tmp()))
+    record = None
+    signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutAbort()))
+    signal.alarm(int(cfg["total_timeout"]))
+    try:
+        record = run_pipeline(cfg, tmpdir)
+    except TimeoutAbort:
+        record = error_record("Run exceeded total timeout.", "total-timeout")
+    except Exception as e:  # R5: no failure disappears silently.
+        record = error_record("Failed due to an unexpected error.", type(e).__name__)
+    finally:
+        signal.alarm(0)
+        # The per-run temp dir (originals + resized images) is deleted regardless of outcome;
+        # only the latest screenshot per display persists, under the state dir.
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        release_lock(lock)
+
+    if record.get("status") == "skip":
+        log("skip — summary ~same as the last entry; no line written")
+        return 0
+
+    path = append_markdown(cfg, record)
+    if record["status"] == "analyzed":
+        save_last_summary(record["summary"])
+    log(f"wrote: {record['status']} → {path}")
+    return 0
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="work-diary-capture", description="Local work-diary capture CLI"
+    )
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser(
+        "capture-once", help="Capture and summarize the screen once; append to the daily Markdown."
+    )
+    args = parser.parse_args(argv)
+
+    if args.cmd == "capture-once":
+        return capture_once(load_config())
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

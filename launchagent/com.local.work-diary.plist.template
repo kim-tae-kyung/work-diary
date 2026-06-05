@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- scripts/install.sh substitutes the __PY__ / __BIN__ / __OUT__ / __ERR__ tokens
+     and renders this to ~/Library/LaunchAgents/com.local.work-diary.plist.
+     __PY__ pins the interpreter because launchd's PATH lacks Homebrew; it is also
+     the Screen Recording grant target. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.local.work-diary</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PY__</string>
+    <string>__BIN__</string>
+    <string>capture-once</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__OUT__</string>
+
+  <key>StandardErrorPath</key>
+  <string>__ERR__</string>
+</dict>
+</plist>

@@ -1,0 +1,37 @@
+# work-diary config example.
+# Use at: ~/.config/work-diary/config.toml  (or the WORK_DIARY_CONFIG env path)
+# If the file is absent, the CLI runs on built-in defaults. Unknown keys are ignored.
+# Parsing config.toml requires Python ≥3.11 (tomllib).
+
+# Daily Markdown root. Entry path is <diary_root>/YYYY/MM/YYYY-MM-DD.md.
+# LaunchAgent does not guarantee a cwd, so use an absolute path.
+# Caution (design §operational cautions): do not default to an iCloud/Dropbox/Git auto-sync path.
+# Default (in code) is ~/Desktop/diary/diary, which macOS "Desktop & Documents" iCloud may sync.
+# Uncomment and set an absolute path to override:
+# diary_root = "/Users/YOUR_USERNAME/Desktop/diary/diary"
+
+# Model (design §fixed decisions default). If your installed tag differs, check `ollama list`.
+model = "gemma4:12b"
+ollama_url = "http://localhost:11434"
+
+# Timeouts (seconds). design §lock and timeout.
+api_timeout = 180     # Ollama /api/chat call budget
+total_timeout = 240   # total run budget (also used for stale-lock detection)
+
+# Image resize longest edge (px). design §image resize policy.
+resize_single = 1600  # single display
+resize_multi = 2200   # multiple displays
+max_displays = 4      # max number of displays to attempt to capture
+
+# Post-screening (design §post-screening). The model judges sensitivity; if its
+# caution_tags contain any of these tags, the entry is redacted.
+block_tags = ["secret-detected", "possibly-sensitive"]
+
+# Skip a log line when the new summary is essentially the same as the last written one
+# (design §skip). The model still runs every interval; only the duplicate line is dropped.
+skip_similar = true
+similarity_threshold = 0.85   # difflib ratio ≥ this ⇒ treat as a duplicate and skip the line
+
+# Keep the latest screenshot of every display in the state dir, refreshed each run.
+# false = keep nothing (more private; "volatile originals").
+store_last_screenshot = true
