@@ -20,7 +20,7 @@ requires a GUI session and Screen Recording permission.
 - Target: Apple Silicon Mac, M2 Pro, 16GB unified memory, macOS 26.
 - Local tools available: `screencapture`, `launchctl`, `sips`, `python3`.
 - Ollama is not installed yet; install and model download are a required verification step.
-- Default model: `gemma4:12b` (vision, 11.9B, Q4_K_M, ~7.6GB). Local capture/analysis speed depends on
+- Default model: `gemma4:12b-it-qat` (vision, 11.9B, QAT int4 / Q4_0, ~7.2GB). Local capture/analysis speed depends on
   resolution, monitor count, and Ollama version, so a local benchmark is a pre-release blocker.
 
 ## Fixed decisions
@@ -30,7 +30,7 @@ requires a GUI session and Screen Recording permission.
 - Implementation: a single Python 3 stdlib CLI (`work-diary-capture`). No external dependencies.
 - Input: screenshot images only (the only required permission is Screen Recording).
 - Execution: a `LaunchAgent` runs the CLI every 5 minutes.
-- Model: `gemma4:12b` by default, via the Ollama REST API `POST /api/chat`, `"stream": false`.
+- Model: `gemma4:12b-it-qat` by default (Google's QAT int4 / Q4_0 checkpoint), via the Ollama REST API `POST /api/chat`, `"stream": false`.
 - Structured output: the request sets `"format"` (JSON schema) so the model always returns valid JSON.
 - Model residency: `"keep_alive": 0` — unload the model right after each run so nothing stays resident between
   captures. Each run pays a cold-load cost, which is accepted.
@@ -123,7 +123,7 @@ The request is built with the Python stdlib (`json`/`urllib`). Shape:
 
 ```json
 {
-  "model": "gemma4:12b",
+  "model": "gemma4:12b-it-qat",
   "stream": false,
   "keep_alive": 0,
   "options": { "temperature": 0 },
@@ -253,8 +253,8 @@ Automated by `scripts/verify.sh` (pre-release blocker):
 
 ```bash
 ollama --version
-ollama pull gemma4:12b
-ollama list | grep gemma4:12b
+ollama pull gemma4:12b-it-qat
+ollama list | grep gemma4:12b-it-qat
 ```
 
 Sample vision call:
@@ -263,7 +263,7 @@ Sample vision call:
 IMG=$(base64 < /tmp/test.jpg | tr -d '\n')
 curl -sS -X POST http://localhost:11434/api/chat \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemma4:12b","stream":false,
+  -d '{"model":"gemma4:12b-it-qat","stream":false,
        "messages":[{"role":"user","content":"What is in this image? Be concise.","images":["'"$IMG"'"]}]}'
 ```
 
@@ -311,5 +311,5 @@ Targets:
 ## References
 
 - Google, "Introducing Gemma 4 12B": https://blog.google/innovation-and-ai/technology/developers-tools/introducing-gemma-4-12b/
-- Ollama model registry, `gemma4:12b`: https://registry.ollama.com/library/gemma4%3A12b
+- Ollama model registry, `gemma4:12b-it-qat`: https://registry.ollama.com/library/gemma4%3A12b-it-qat
 - Ollama Vision documentation: https://docs.ollama.com/capabilities/vision

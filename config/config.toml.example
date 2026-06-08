@@ -11,7 +11,7 @@
 # diary_root = "/Users/YOUR_USERNAME/Desktop/diary/diary"
 
 # Model (design §fixed decisions default). If your installed tag differs, check `ollama list`.
-model = "gemma4:12b"
+model = "gemma4:12b-it-qat"
 ollama_url = "http://localhost:11434"
 
 # Timeouts (seconds). design §lock and timeout.

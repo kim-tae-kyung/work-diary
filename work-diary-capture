@@ -36,7 +36,7 @@ from pathlib import Path
 
 DEFAULTS = {
     "diary_root": str(Path.home() / "Desktop" / "diary" / "diary"),
-    "model": "gemma4:12b",
+    "model": "gemma4:12b-it-qat",
     "ollama_url": "http://localhost:11434",
     "api_timeout": 180,
     "total_timeout": 240,

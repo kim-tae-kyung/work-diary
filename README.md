@@ -107,9 +107,14 @@ uses built-in defaults. Key options: `diary_root`, `model`, `api_timeout`, `tota
   the `llama-server` runtime, so `/api/chat` fails with HTTP 500 (`llama-server binary not found … run cmake
   first`). Installing `brew install --cask ollama-app` (or the official app) includes the runner. Models are
   shared at `~/.ollama/models`, so a reinstall does not re-download them.
-- **Model `gemma4:12b` is verified working** (vision, 11.9B, Q4_K_M, 7.6GB). To use a different tag, change
-  `model` in `config.toml` and re-validate with `scripts/verify.sh`.
-  Ref: [Ollama Vision](https://docs.ollama.com/capabilities/vision).
+- **Model `gemma4:12b-it-qat` is verified working** (vision, 11.9B, QAT int4 / Q4_0, ~7.2GB). This is
+  Google's Quantization-Aware-Training checkpoint: near-BF16 quality at int4 size, so better than the
+  plain `gemma4:12b` PTQ quant at the same footprint. To use a different tag, change `model` in
+  `config.toml` and re-validate with `scripts/verify.sh`.
+  Note (FP4): Gemma 4 QAT on the Ollama/llama.cpp path is **int4 (Q4_0), not FP4** — the registry's
+  `gemma4:12b-nvfp4` tag is an Nvidia Blackwell GPU format and does not run on Apple Silicon via Ollama.
+  Refs: [QAT blog](https://blog.google/innovation-and-ai/technology/developers-tools/quantization-aware-training-gemma-4/),
+  [Ollama Vision](https://docs.ollama.com/capabilities/vision).
 - **Storage path sync.** The default `diary_root` lives under `~/Desktop/diary`, which the macOS "Desktop &
   Documents" iCloud feature auto-syncs if enabled. design §operational cautions advises against defaulting to
   an auto-sync path. Turn it off or set `diary_root` to a non-synced path.

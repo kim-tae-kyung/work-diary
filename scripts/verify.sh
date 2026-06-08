@@ -8,7 +8,7 @@ MODEL="${MODEL:-}"
 if [[ -z "$MODEL" && -f "$CFG" ]]; then
   MODEL="$(grep -E '^[[:space:]]*model[[:space:]]*=' "$CFG" | head -1 | sed -E 's/.*"([^"]*)".*/\1/')"
 fi
-MODEL="${MODEL:-gemma4:12b}"
+MODEL="${MODEL:-gemma4:12b-it-qat}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
