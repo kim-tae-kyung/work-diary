@@ -19,6 +19,7 @@ requires a GUI session and Screen Recording permission.
 
 - Target: Apple Silicon Mac, M2 Pro, 16GB unified memory, macOS 26.
 - Local tools available: `screencapture`, `launchctl`, `sips`, `python3`.
+- Optional: `swiftc` (Xcode Command Line Tools) to build the OCR helper. Absent → OCR off, vision-only.
 - Ollama is not installed yet; install and model download are a required verification step.
 - Default model: `gemma4:12b-it-qat` (vision, 11.9B, QAT int4 / Q4_0, ~7.2GB). Local capture/analysis speed depends on
   resolution, monitor count, and Ollama version, so a local benchmark is a pre-release blocker.
@@ -87,14 +88,21 @@ Status column: `OK` / `NOK`. The pipeline keeps four internal outcomes for contr
 3. If the lock cannot be acquired, a previous run is still in progress → exit.
 4. `screencapture -x` saves each display to a temp dir (shutter muted, non-frontmost monitors included).
 5. The latest screenshot per display is refreshed in the state dir (`store_last_screenshot`).
-6. `sips` downscales the images to reduce model input cost and latency.
-7. Resized images are base64-encoded.
-8. The CLI calls Ollama `/api/chat` with the vision prompt and image array, and parses the JSON response.
-9. Post-screening: if the model set a sensitivity caution tag (`secret-detected` / `possibly-sensitive`), the
-   content is not stored and a `redacted` line is appended.
-10. Skip check: if the new summary is essentially the same as the last written one, no line is written. (§skip)
-11. Otherwise the summary is appended as one `analyzed` line and stored as the new "last summary".
-12. Resized/encoded images and the per-run temp dir are deleted; the lock is released.
+6. `sips` downscales each display image (longest edge `resize_single`) to reduce model input cost and latency.
+7. Each resized image is base64-encoded.
+8. Stage 1 — one Ollama `/api/chat` call **per display** (single image), each returning
+   `{category, detail, caution_tags}`. When the OCR helper is available, the display's real on-screen
+   text (Apple Vision, from the full-resolution capture) is appended to the prompt so `detail` is
+   grounded rather than guessed (§OCR grounding). The model stays warm between calls; the last call
+   unloads it (`keep_alive`). A display whose response is unparseable is skipped; the run errors only
+   if every display fails.
+9. Stage 2 — the per-display findings are collapsed into the single dominant activity by one text-only call
+   (`{category, detail}`); a single display skips this step. The line is composed as `category (detail)`.
+10. Post-screening: if **any** display set a sensitivity caution tag (`secret-detected` / `possibly-sensitive`),
+    the content is not stored and a `redacted` line is appended.
+11. Skip check: if the new summary is essentially the same as the last written one, no line is written. (§skip)
+12. Otherwise the summary is appended as one `analyzed` line and stored as the new "last summary".
+13. Resized/encoded images and the per-run temp dir are deleted; the lock is released.
 
 Deleting resized images, the temp dir, and any payload is guaranteed by a `finally` (regardless of
 success/failure). Only the latest screenshot per display and the last summary persist between runs.
@@ -119,32 +127,45 @@ the log — duplicates are dropped, but slow drift eventually crosses the thresh
 
 ## Model request
 
-The request is built with the Python stdlib (`json`/`urllib`). Shape:
+Two stages, both built with the Python stdlib (`json`/`urllib`) via one `ollama_call(cfg, user_msg, schema,
+keep_alive)` helper. Each model call sends **one** image (or none, for aggregation) so every screen gets the
+model's full attention instead of N screens blended into one guess.
+
+**Stage 1 — per display** (one call per screen):
 
 ```json
 {
   "model": "gemma4:12b-it-qat",
   "stream": false,
-  "keep_alive": 0,
+  "keep_alive": "60s",
   "options": { "temperature": 0 },
   "format": { "type": "object",
     "properties": {
-      "summary": { "type": "string" },
+      "category": { "type": "string" },
+      "detail": { "type": "string" },
       "caution_tags": { "type": "array", "items": { "type": "string" } } },
-    "required": ["summary", "caution_tags"] },
+    "required": ["category", "detail", "caution_tags"] },
   "messages": [
     { "role": "system", "content": "You summarize screenshots into privacy-preserving work diary entries." },
-    { "role": "user", "content": "<prompt: N screens, one short Korean activity line; see §prompt principles>",
+    { "role": "user", "content": "<MONITOR_PROMPT: classify THIS one screen; see §prompt principles>",
       "images": ["<base64>"] }
   ]
 }
 ```
 
-`summary` is one short Korean activity line (whitespace/newlines collapsed to a single line when written);
-`caution_tags` exists only to drive post-screening and is not printed. `"options": {"temperature": 0}` forces greedy decoding: the
+**Stage 2 — aggregation** (text only, no images; skipped for a single display): same envelope with
+`format` `{category, detail}` and a user message listing the per-display `category | detail` findings, asking
+for the single dominant activity.
+
+`keep_alive` is `"60s"` for the per-display calls so the model is not cold-loaded N+1 times; the **final** call
+of the run uses `keep_alive: 0` to unload promptly (no idle RAM between 5-minute runs). The diary line is
+composed in code as `category (detail)` (detail omitted when empty), so the format is uniform — the model no
+longer chooses parens vs colon. `caution_tags` exists only to drive post-screening and is not printed;
+redaction screens the **union** across displays. `"options": {"temperature": 0}` forces greedy decoding: the
 gemma model defaults to `temperature=1`, which makes OCR/summary hallucinate and vary run to run (at temp 0,
-top_p/top_k are moot). Setting `"format"` to a JSON schema forces schema-valid JSON output, reducing parse failures. The payload is serialized by a JSON encoder, never by ad hoc string
-concatenation, since captured screens may contain quotes, newlines, and control chars.
+top_p/top_k are moot). Setting `"format"` to a JSON schema forces schema-valid JSON output, reducing parse
+failures. The payload is serialized by a JSON encoder, never by ad hoc string concatenation, since captured
+screens may contain quotes, newlines, and control chars.
 
 ### Post-screening
 
@@ -158,19 +179,26 @@ the model's judgment, so the prompt instructs it explicitly (§prompt principles
 
 ## Prompt principles
 
-- The prompt states the display count (`{n}`); the model writes one short `summary` covering all displays.
-- `summary`: one short Korean sentence classifying the activity for calendar-style time tracking
-  (e.g. 코딩/개발, 자료 조사, 문서·PPT 작성, 이메일·메신저, 회의·영상 시청, 휴식·비업무). Add a brief topic/app
-  hint only when clearly legible. The model must NOT guess or invent file/project/library names, versions,
-  URLs, or small text it cannot read — when unsure, give only the activity category. This keeps coarse-but-true
-  entries instead of confident-but-wrong specifics: Ollama caps gemma vision at 896²/image (§image resize
-  policy Known Issue), so small text is unreadable and asking for specifics only induces fabrication.
+- **Stage 1 (`MONITOR_PROMPT`)** classifies ONE display per call. `category` is one of a fixed list
+  (코딩/개발, 자료 조사, 문서·PPT 작성, 이메일·메신저, 회의·영상 시청, 디자인, 휴식·비업무); idle/locked/empty
+  screens map to 휴식·비업무. `detail` is a brief Korean topic/app hint **only when clearly legible**, else an
+  empty string. The model must NOT guess or invent file/project/library names, versions, URLs, or small text it
+  cannot read. This keeps coarse-but-true entries instead of confident-but-wrong specifics: Ollama caps gemma
+  vision at 896²/image (§image resize policy Known Issue), so small text is unreadable and asking for specifics
+  only induces fabrication. One image per call gives each screen the full 896² budget and stops the displays
+  blending into a single hallucinated guess.
+- **Stage 2 (`AGG_PROMPT`)** is text-only: given the per-display `category | detail` findings, pick the single
+  dominant work activity (idle/video/wallpaper/secondary screens lose to active work) and emit `{category,
+  detail}`. It must not introduce any detail absent from the stage-1 findings.
+- When OCR is available, `OCR_SECTION` is appended to the stage-1 prompt with the screen's real text and tells
+  the model to ground `detail` in it rather than guess (§OCR grounding) — the same secret/privacy rules apply.
+- The diary line is composed in code as `category (detail)` — the format is fixed, not chosen by the model.
 - Do not transcribe passwords, verification codes, API tokens, private message contents, email bodies, or
-  financial/medical/legal details into the summary.
+  financial/medical/legal details into `detail` (this applies to OCR-sourced text too).
 - If a screen looks sensitive, generalize and add `caution_tags: ["possibly-sensitive"]`.
 - If a password/token/verification code is visible, add `caution_tags: ["secret-detected"]` — the signal that
-  drives post-screening redaction.
-- Force JSON output via the `"format"` schema; only `summary` is written, on one line.
+  drives post-screening redaction. Redaction screens the union of every display's tags.
+- Force JSON output via the `"format"` schema at both stages.
 
 ## Error handling
 
@@ -228,21 +256,46 @@ Install and operations (status / stop / run-now) are in the [README](../README.m
 
 - Lock path: `~/Library/Application Support/work-diary/capture.lock`.
 - Lock method: atomic `mkdir` (flock is not available on macOS by default).
-- Total run timeout: 240s. Ollama API timeout: 180s.
-- With `keep_alive: 0`, each run includes a cold load (~7.6GB). This eats into the 180s API budget, so the
-  performance check measures with the cold load included.
+- Total run timeout: 360s (covers N per-display calls + 1 aggregation). Ollama API timeout: 180s per call.
+- The run cold-loads the model once (~7.6GB), then keeps it warm (`keep_alive: "60s"`) across the per-display
+  and aggregation calls; the final call unloads it (`keep_alive: 0`), so RAM is free between 5-minute runs.
 - If one analysis exceeds the 5-minute interval, the next run does not start concurrently (lock).
 
 ## Image resize policy
 
-- Single monitor: longest edge ≤ 1600px. Multi-monitor: longest edge ≤ 2200px.
-- If average processing time approaches 5 minutes, lower the longest edge or lengthen the interval.
+- Per display: longest edge ≤ `resize_single` (1600px). Every model call is single-image, so there is no
+  separate multi-monitor size — the legacy `resize_multi` key is removed (unknown keys are ignored).
+- If average processing time approaches 5 minutes, lower the longest edge, reduce `max_displays`, or lengthen
+  the interval — per-display calls run sequentially, so total time scales with the display count.
 
 Known Issue — Ollama caps gemma3 vision at a fixed 896×896 per image (256 tokens); it does **not**
 implement pan-and-scan tiling ([ollama#10392](https://github.com/ollama/ollama/issues/10392),
 [multimodal](https://deepwiki.com/ollama/ollama/7.3-multimodal-and-vision-support)). So raising the resize
 longest edge above ~896px buys no extra detail — each full screen is squashed to 896², destroying small text,
-which is the dominant cause of wrong OCR/summaries. Measured input for a 2-display capture is ~770 tokens
+which is the dominant cause of wrong OCR/summaries. Sending one screen per call (rather than all displays in
+one request) does not lift the 896² cap, but it gives each screen the full budget and stops displays blending
+into one fabricated guess. Exact small text is recovered separately by on-device OCR (§OCR grounding), which
+is not subject to the 896² cap.
+
+## OCR grounding
+
+The 896²/image cap means the vision model cannot read small text, so it would otherwise invent specifics. To
+recover real text, a tiny native helper (`ocr/work-diary-ocr.swift`, Apple Vision `VNRecognizeTextRequest`,
+`.accurate`, `ko-KR`+`en-US`) runs on the **full-resolution** capture — Vision is not capped at 896². It is a
+separate process invoked like `screencapture`/`sips`, so the Python CLI stays stdlib-only (no pyobjc). It reads
+an image **file**, not the screen, so it needs no Screen Recording permission. `scripts/install.sh` builds it
+to `~/.local/bin/work-diary-ocr`; the CLI resolves it next to itself, then on `PATH`.
+
+- Output: a JSON array `[{"t": text, "h": normalized-box-height, "c": confidence}]`, one entry per text
+  observation. The CLI ranks by `h` (taller box = larger font), de-dupes, and passes the top `ocr_max_lines`
+  to the stage-1 prompt (`OCR_SECTION`). Largest-font-first favours titles/app/tab names — high signal — and
+  naturally down-weights dense body text, which limits how much sensitive content reaches the model.
+- The prompt tells the model to ground `category`/`detail` in the OCR text but **not** to copy
+  passwords/tokens/codes or private message/email bodies, and to set `caution_tags` as usual; redaction is
+  unchanged. OCR text is transient (never written to disk), like the screenshots.
+- Best-effort: a missing helper (no `swiftc` at install) or any OCR failure degrades to vision-only. Toggle
+  with `use_ocr`; tune `ocr_languages` / `ocr_max_lines` / `ocr_timeout` / `ocr_helper` in `config.toml`.
+- Cost: one extra subprocess per display per run; Vision OCR on a single screen is sub-second. Measured input for a 2-display capture is ~770 tokens
 (≈ prompt + 256×images), far below Ollama's default `num_ctx` of 4096, so there is no context truncation and
 raising `num_ctx` does nothing. Not pursued: more detail would require a different model (a dynamic-resolution
 document VLM) or manual pan-and-scan tiling — the decision is to keep gemma4 and ask only for coarse activity.

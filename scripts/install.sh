@@ -27,6 +27,17 @@ echo "==> Install CLI: $BIN"
 mkdir -p "$BIN_DIR"
 install -m 0755 "$REPO/work-diary-capture" "$BIN"
 
+echo "==> Build OCR helper: $BIN_DIR/work-diary-ocr"
+if command -v swiftc >/dev/null 2>&1; then
+  if swiftc -O -o "$BIN_DIR/work-diary-ocr" "$REPO/ocr/work-diary-ocr.swift"; then
+    echo "    Built (on-device OCR grounds the summary in real on-screen text)"
+  else
+    echo "    swiftc build failed — OCR disabled (vision-only); the CLI still runs." >&2
+  fi
+else
+  echo "    swiftc not found — OCR disabled (vision-only). Install Xcode CLT: xcode-select --install"
+fi
+
 echo "==> Config file"
 mkdir -p "$CFG_DIR"
 if [[ -f "$CFG_DIR/config.toml" ]]; then

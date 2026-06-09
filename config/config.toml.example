@@ -15,13 +15,25 @@ model = "gemma4:12b-it-qat"
 ollama_url = "http://localhost:11434"
 
 # Timeouts (seconds). design §lock and timeout.
-api_timeout = 180     # Ollama /api/chat call budget
-total_timeout = 240   # total run budget (also used for stale-lock detection)
+api_timeout = 180     # per Ollama /api/chat call budget
+total_timeout = 360   # total run budget (N per-display calls + 1 aggregation, sequential); also stale-lock detection
 
 # Image resize longest edge (px). design §image resize policy.
-resize_single = 1600  # single display
-resize_multi = 2200   # multiple displays
+# Each display is sent as its own single-image call, so this applies per display.
+# Note: Ollama caps gemma vision at ~896²/image, so raising this past that gives little OCR gain.
+resize_single = 1600
+# resize_multi is removed — every model call is single-image now (unknown keys are ignored).
 max_displays = 4      # max number of displays to attempt to capture
+
+# On-device OCR (Apple Vision via the work-diary-ocr helper; design §OCR grounding).
+# Reads real text off the full-resolution capture and feeds the most prominent lines to the model,
+# so detail is grounded instead of guessed. Best-effort: if the helper is missing, runs vision-only.
+# The helper is built by scripts/install.sh (needs Xcode Command Line Tools / swiftc).
+use_ocr = true
+ocr_languages = ["ko-KR", "en-US"]   # Vision recognition languages (BCP-47)
+ocr_max_lines = 40                   # how many of the largest-font OCR lines to pass to the model
+ocr_timeout = 20                     # per-image OCR subprocess budget (seconds)
+# ocr_helper = "/Users/YOUR_USERNAME/.local/bin/work-diary-ocr"  # override; default auto-resolves
 
 # Post-screening (design §post-screening). The model judges sensitivity; if its
 # caution_tags contain any of these tags, the entry is redacted.

@@ -11,5 +11,8 @@ config.toml
 __pycache__/
 *.pyc
 
+# Compiled OCR helper (built by scripts/install.sh into ~/.local/bin; ignore any local build)
+/work-diary-ocr
+
 # macOS / editor cruft
 .DS_Store

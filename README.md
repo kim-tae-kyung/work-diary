@@ -1,12 +1,12 @@
 # work-diary
 
-A local macOS work diary. Every 5 minutes it captures every display, classifies the current activity with a
-local Ollama vision model into one short Korean line (calendar-style time tracking: coding / research /
-docs / rest …), redacts it when secrets are detected, and appends a single line per capture
-(`time | status | summary`) to a daily Markdown file. When the new line is essentially the same as the last
-one, it writes nothing. The
-only input is screenshot images; per-run images are deleted right after analysis and the latest screenshot
-per display is kept in the state dir. All processing stays local.
+A local macOS work diary. Every 5 minutes it captures each display, classifies each screen with a local
+Ollama vision model — grounded by on-device OCR (Apple Vision) of the real on-screen text — then aggregates
+the displays into one short Korean line (calendar-style time tracking: coding / research / docs / rest …),
+redacts it when secrets are detected, and appends a single line per capture (`time | status | summary`) to a
+daily Markdown file. When the new line is essentially the same as the last one, it writes nothing. The only
+input is screenshot images; per-run images are deleted right after analysis and the latest screenshot per
+display is kept in the state dir. All processing stays local.
 
 - What/why: [docs/PRD.md](docs/PRD.md)
 - How (architecture/verification): [docs/design.md](docs/design.md)
@@ -16,6 +16,7 @@ per display is kept in the state dir. All processing stays local.
 | Path | Role |
 |---|---|
 | `work-diary-capture` | Single-file CLI (Python stdlib only). Subcommand `capture-once`. |
+| `ocr/work-diary-ocr.swift` | On-device OCR helper (Apple Vision). Built by `install.sh` to `~/.local/bin`. |
 | `config/config.toml.example` | Config example. Copy to `~/.config/work-diary/config.toml`. |
 | `launchagent/com.local.work-diary.plist.template` | LaunchAgent template (5-minute interval). |
 | `scripts/install.sh` | Install the CLI and register the LaunchAgent. |
@@ -30,6 +31,8 @@ Scope: automatic capture/summarize/daily-record, local processing, secret screen
 - [Ollama](https://ollama.com/download) and one vision model. No external Python dependencies.
   If installing via Homebrew, use the **cask**: `brew install --cask ollama-app`
   (the `ollama` formula ships without the runner — see Known Issues).
+- Optional: Xcode Command Line Tools (`xcode-select --install`) so `install.sh` can build the OCR helper.
+  Without it the diary still runs, vision-only (no OCR grounding).
 
 ## Install
 
@@ -98,8 +101,9 @@ still distinguishes the two. A near-duplicate of the previous line is skipped en
 
 Copy `config/config.toml.example` to `~/.config/work-diary/config.toml` and edit. Without the file, the CLI
 uses built-in defaults. Key options: `diary_root`, `model`, `api_timeout`, `total_timeout`,
-`resize_single`/`resize_multi`, `block_tags`, duplicate-skip (`skip_similar`, `similarity_threshold`), and
-`store_last_screenshot`.
+`resize_single` (per-display longest edge), OCR (`use_ocr`, `ocr_languages`, `ocr_max_lines`,
+`ocr_timeout`, `ocr_helper`), `block_tags`, duplicate-skip (`skip_similar`, `similarity_threshold`),
+and `store_last_screenshot`.
 
 ## Known Issues
 

@@ -5,6 +5,7 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$HOME/.local/bin/work-diary-capture"
+OCR_BIN="$HOME/.local/bin/work-diary-ocr"
 PLIST="$HOME/Library/LaunchAgents/com.local.work-diary.plist"
 LABEL="com.local.work-diary"
 
@@ -17,6 +18,9 @@ rm -f "$PLIST"
 
 echo "==> Remove CLI: $BIN"
 rm -f "$BIN"
+
+echo "==> Remove OCR helper: $OCR_BIN"
+rm -f "$OCR_BIN"
 
 cat <<EOF
 
